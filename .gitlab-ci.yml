@@ -1,0 +1,334 @@
+# 私仓地址
+image: xxx/rockylinux-envsubst-stk:v0.0.1
+variables:
+  # gitlab域名
+  GITLAB_ADDRESS: "https://gitlab-xxx.com"
+  # 预执行的数据库地址
+  PRE_EXECUTE_DB_HOST: "10.xx.xx.xx"  
+  PRE_EXECUTE_DB_DEVOPS_USERNAME: "devops"  
+  # 环境标识|数据库ip|数据库账号
+  ENV_MSG: "test|10.xx.xx.xx|test_devops~uat|10.xx.xx.xx|uat_devops"
+  # 记录原分支原有SQL文件
+  SQL_LIST_NAME: "origin_sql_file.txt"
+  # 分支新增的SQL文件列表
+  SQL_NEW_ADD_FILE: "new_add_sql_file.txt"
+
+stages:
+  - get_origin_sql_file
+  - check
+  - execute
+
+get_origin_sql_file:
+  stage: get_origin_sql_file
+  tags:
+    - sre
+  script:    
+    - git config core.quotepath false
+    - |-
+      if [ ! -f "$SQL_LIST_NAME" ];then
+        for sql_file in `find sql* -type f -name "*.sql"|grep -v "张三-123456-demo"`
+        do
+          sql_file_md5=$(md5sum $sql_file|cut -d " " -f1)
+          echo "$sql_file $sql_file_md5" >>$SQL_LIST_NAME
+        done
+         
+        stk update gitlab --gitlab-addr ${GITLAB_ADDRESS} --gitlab-project-id ${CI_PROJECT_ID} \
+        --gitlab-project-branch ${CI_COMMIT_BRANCH} --gitlab-token ${CONFIGS_TOKEN} \
+        --gitlab-filename-list $SQL_LIST_NAME --gitlab-commit-username "${CI_COMMIT_AUTHOR}[skip ci]"
+      fi
+  artifacts:
+    paths:
+      - $SQL_LIST_NAME
+    expire_in: "1 days"
+  only:
+    refs:
+      - main
+
+pre_check:
+  stage: check
+  tags:
+    - sre
+  script:
+    - git config core.quotepath false
+    - MODIFIED_FILES=$(git diff --name-status HEAD HEAD~1|awk '{print $1 "~" $2}'| xargs -I {} echo {})
+    - echo $MODIFIED_FILES
+    - |-
+      # 当前所有sql文件列表
+      NEW_SQL_LIST_NAME="new_sql_file.txt"
+
+      for sql_file in `find sql* -type f -name "*.sql"|grep -v "张三-123456-demo"`
+      do
+        sql_file_md5=$(md5sum $sql_file|cut -d " " -f1)
+        echo "$sql_file $sql_file_md5" >>$NEW_SQL_LIST_NAME
+      done
+
+      # 检测原有文件是否被修改/删除
+      while IFS= read -r origin_sql_file
+      do
+        origin_sql_file_name=$(echo $origin_sql_file|cut -d " " -f1)
+        origin_sql_file_md5=$(echo $origin_sql_file|cut -d " " -f2)
+        if [ `grep -w $origin_sql_file_name $NEW_SQL_LIST_NAME|wc -l` -eq 1 ];then
+            # 比较md5值
+            new_md5=$(grep -w $origin_sql_file_name $NEW_SQL_LIST_NAME|cut -d " " -f2)
+            if [ X"$new_md5" != X"$origin_sql_file_md5" ];then
+              echo "原有文件$origin_sql_file_name被修改，不符合规范"
+              exit 1 
+            fi
+        else
+          echo "原有文件$origin_sql_file_name被删除，不符合规范"
+          exit 1    
+        fi        
+      done < $SQL_LIST_NAME
+
+      # 实际新增的文件列表=新的所有sql文件-main分支原有sql文件列表
+      if [ `diff $SQL_LIST_NAME $NEW_SQL_LIST_NAME|wc -l` -eq 0 ];then
+        touch $SQL_NEW_ADD_FILE
+      else
+        diff $SQL_LIST_NAME $NEW_SQL_LIST_NAME|grep '^>'|cut -c 3-|cut -d " " -f1|sort >$SQL_NEW_ADD_FILE || true
+      fi
+
+      if [ -s "$SQL_NEW_ADD_FILE" ];then
+        echo -e "变更文件：\n`cat $SQL_NEW_ADD_FILE`"
+        for file in `cat $SQL_NEW_ADD_FILE`
+        do
+          dirname=$(dirname $file)
+          filename=$(basename $file)
+          # 检测文件命名是否规范
+          if [[ "$filename" =~ ^[0-9]{6}-[^-]+(-.+\.sql)?$ ]];then  
+            # 检测文件名编号是否和原有冲突
+            file_id=$(echo $filename|cut -d "-" -f 1)
+            if [ `ls $dirname/$file_id*|wc -l` -gt 1 ];then
+              echo "文件名编号$file_id和原有文件冲突，请在原有文件编号上进行递增"
+              exit 1
+            fi
+
+            # 检测文件内容，表名前是否带库名
+            pattern='\b[a-zA-Z_]{5,}\.[a-zA-Z_]+\b'
+            if [ `grep -E "$pattern" $file|wc -l` -eq 1 ];then
+                echo "文件$file内容不符合规范，表名前不允许带库名"
+                exit 1
+            fi       
+
+            # 其余规范检测
+            stk check mysql --sql-filename $file
+
+            echo "check $file success"
+          else
+            echo "文件名$filename不符合规范：六位数字编号-人名-编号(可选)-功能简单描述(可选).sql"
+            exit 1
+          fi
+
+        done        
+      else
+        echo "没有要检查的新增sql文件"
+      fi
+  artifacts:
+    paths:
+      - $SQL_NEW_ADD_FILE
+    expire_in: "1 days"
+  except:
+    refs:
+      - main
+
+pre_sql_execute:
+  stage: execute
+  tags:
+    - sre
+  script:
+    - git config core.quotepath false
+    - |-
+      DB_DEVOPS_PASSWD=`echo ${DATABASE_DEVOPS_PASSWD}|base64 -d`
+      if [ -s "$SQL_NEW_ADD_FILE" ];then
+        echo -e "变更文件：\n`cat $SQL_NEW_ADD_FILE`"
+        for file in `cat $SQL_NEW_ADD_FILE`
+        do
+          DIRNAME=$(dirname $file)
+          TYPE=$(echo $DIRNAME|awk -F\/ '{print $1}'|sed 's/sql_//g')
+          ENV=$(ls sql_data_clean|sed -s 's/\///g')
+          DBNAME=$(echo $DIRNAME|awk -F\/ -v prefix=$ENV '{print prefix"_"$NF}')
+
+          if [ -z "$DB_HOST" -o -z "$DB_DEVOPS_USERNAME" ]; then
+            for MSG in $(echo $ENV_MSG|sed 's/~/ /g')
+            do
+              if [ "X${ENV}" == "X$(echo $MSG|cut -d '|' -f1)" ];then
+                DB_HOST=$(echo $MSG|cut -d "|" -f2)
+                DB_DEVOPS_USERNAME=$(echo $MSG|cut -d "|" -f3)
+                break
+              fi
+            done  
+          fi
+
+          echo "select count(*) from sql_execution_records where env=\"${ENV}\" and sql_filename=\"${file}\";">${file}.select
+          num=`stk execute mysql --db-host ${DB_HOST} --db-name ${ENV}_sql_execution_record --db-user ${DB_DEVOPS_USERNAME} --db-password ${DB_DEVOPS_PASSWD} --sql-filename ${file}.select --sql-type select`
+
+          if [ $num -eq 0 ];then
+            execute_file=$file
+
+            echo "准备在临时环境创建库$DBNAME"
+            echo "CREATE DATABASE IF NOT EXISTS ${DBNAME};">${file}.db
+            stk execute mysql --db-host ${PRE_EXECUTE_DB_HOST} --db-user ${PRE_EXECUTE_DB_DEVOPS_USERNAME} --db-password ${DB_DEVOPS_PASSWD} --sql-filename ${file}.db --sql-type other
+
+            echo "准备从${ENV}环境同步库${DBNAME}的表结构到临时环境"
+            stk transfer mysql --source-db-host ${DB_HOST} --source-db-name ${DBNAME} --source-db-user ${DB_DEVOPS_USERNAME} --source-db-password ${DB_DEVOPS_PASSWD} --dst-db-host ${PRE_EXECUTE_DB_HOST} --dst-db-name ${DBNAME} --dst-db-user ${PRE_EXECUTE_DB_DEVOPS_USERNAME} --dst-db-password ${DB_DEVOPS_PASSWD} --need-data false
+
+            echo "准备在临时环境的库$DBNAME执行SQL脚本$file"
+            stk execute mysql --db-host ${PRE_EXECUTE_DB_HOST} --db-name ${DBNAME} --db-user ${PRE_EXECUTE_DB_DEVOPS_USERNAME} --db-password ${DB_DEVOPS_PASSWD} --sql-filename $execute_file --sql-type other
+          else
+            echo "该SQL脚本已在${ENV}环境执行过，不允许再次执行"
+          fi
+        done
+      else
+          echo "没有要预执行的新增sql文件"
+      fi
+  except:
+    refs:
+      - main
+
+check:
+  stage: check
+  tags:
+    - sre
+  script:
+    - git config core.quotepath false
+    - MODIFIED_FILES=$(git diff --name-status HEAD HEAD~1|awk '{print $1 "~" $2}'| xargs -I {} echo {})
+    - echo $MODIFIED_FILES
+    - |-
+      for file in $MODIFIED_FILES
+      do
+        # 修改是M，新增是D，删除是A，R是删除并新增
+        if [ `echo $file|egrep -E '^M~sql_|^A~sql_|^R[0-9]{3}~sql'|wc -l` -eq 1 ];then
+          echo "数据库脚本不允许修改或删除源文件"
+          exit 1
+        elif [ `echo $file|grep ^D~sql_|wc -l` -eq 1 ];then
+          full_path=$(echo $file|awk -F\~ '{print $2}')
+          dirname=$(dirname $full_path)
+          filename=$(basename $full_path)
+          # 检测文件命名是否规范
+          if [[ "$filename" =~ ^[0-9]{6}-[^-]+(-.+\.sql)?$ ]];then  
+            # 检测文件名编号是否和原有冲突
+            file_id=$(echo $filename|cut -d "-" -f 1)
+            if [ `ls $dirname/$file_id*|wc -l` -gt 1 ];then
+              echo "文件名编号$file_id和原有文件冲突，请在原有文件编号上进行递增"
+              exit 1
+            fi
+
+            # 检测文件内容，表名前是否带库名
+            pattern='\b[a-zA-Z_]{5,}\.[a-zA-Z_]+\b'
+            if [ `grep -E "$pattern" $full_path|wc -l` -eq 1 ];then
+                echo "文件$filename内容不符合规范，表名前不允许带库名"
+                exit 1  
+            fi       
+
+            # 其余规范检测
+            stk check mysql --sql-filename $file
+
+            echo "check $full_path success"
+          else
+            echo "文件名$filename不符合规范：六位数字编号-人名-编号(可选)-功能简单描述(可选).sql"
+            exit 1
+          fi
+        fi
+      done
+  only:
+    refs:
+      - main
+
+notify:
+  stage: execute
+  tags:
+    - sre
+  script:
+    - MODIFIED_FILES=$(git diff --name-only HEAD HEAD~1 | xargs -I {} echo {})
+    - echo $MODIFIED_FILES
+    - |-
+      for file in $MODIFIED_FILES
+      do   
+        if [ `echo $file|grep -E '^sql_|^nacos'|wc -l` -eq 1 ];then
+          curl 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key='"${QW_WEBHOOK}"'' \
+            -H 'Content-Type: application/json' \
+            -d '
+            {
+                "msgtype": "markdown",
+                "markdown": {
+                    "content":"### 有人提交了SQL脚本  \n- **branch**: <font color=\"red\">'"${CI_COMMIT_BRANCH}"'</font>  \n- **author**: <font color=\"red\">'"${CI_COMMIT_AUTHOR}"'</font>  \n- **commitMsg**:  \n> '"${CI_COMMIT_MESSAGE}"'"
+                } 
+            }'
+        fi
+      done
+  allow_failure: true
+  only:
+    refs:
+      - main
+
+sql_execute:
+  stage: execute
+  tags:
+    - sre
+  script:
+    - git config core.quotepath false
+    - MODIFIED_FILES=$(git diff --name-only HEAD HEAD~1 | xargs -I {} echo {}| tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ $//')
+    - echo $MODIFIED_FILES
+    - |-
+      DB_DEVOPS_PASSWD=`echo ${DATABASE_DEVOPS_PASSWD}|base64 -d`
+      IF_HAVE_SQL=0
+      for file in $MODIFIED_FILES
+      do
+        if [ `echo $file|grep ^sql_|grep "\.sql"|wc -l` -eq 1 ];then
+          # 有sql变动，将IF_HAVE_SQL变量值赋为1
+          IF_HAVE_SQL=1
+
+          DIRNAME=$(dirname $file)
+          TYPE=$(echo $DIRNAME|awk -F\/ '{print $1}'|sed 's/sql_//g')
+          ENV=$(ls sql_data_clean|sed -s 's/\///g')
+          DBNAME=$(echo $DIRNAME|awk -F\/ -v prefix=$ENV '{print prefix"_"$NF}')
+
+          if [ -z "$DB_HOST" -o -z "$DB_DEVOPS_USERNAME" ]; then
+            for MSG in $(echo $ENV_MSG|sed 's/~/ /g')
+            do
+              if [ "X${ENV}" == "X$(echo $MSG|cut -d '|' -f1)" ];then
+                DB_HOST=$(echo $MSG|cut -d "|" -f2)
+                DB_DEVOPS_USERNAME=$(echo $MSG|cut -d "|" -f3)
+                break
+              fi
+            done  
+          fi
+
+          echo "select count(*) from sql_execution_records where env=\"${ENV}\" and sql_filename=\"${file}\";">${file}.select
+          num=`stk execute mysql --db-host ${DB_HOST} --db-name ${ENV}_sql_execution_record --db-user ${DB_DEVOPS_USERNAME} --db-password ${DB_DEVOPS_PASSWD} --sql-filename ${file}.select --sql-type select`
+
+          if [ $num -eq 0 ];then
+            execute_file=$file
+
+            echo "准备在${ENV}环境的库$DBNAME执行SQL脚本$file"
+            stk execute mysql --db-host ${DB_HOST} --db-name ${DBNAME} --db-user ${DB_DEVOPS_USERNAME} --db-password ${DB_DEVOPS_PASSWD} --sql-filename $execute_file --sql-type other
+            
+            echo "将执行成功的SQL脚本记录到数据库里"
+            NOWTIME=$(date -d "+8 hours" "+%Y-%m-%d %H:%M:%S")
+            echo "insert into sql_execution_records(gitlab_branch, committer, env, sql_filename, execution_time, execution_status, sql_type, dbname) values(\"${CI_COMMIT_BRANCH}\",\"${CI_COMMIT_AUTHOR}\",\"test\",\"$file\",\"${NOWTIME}\",\"success\",\"${TYPE}\",\"${DBNAME}\");">${file}.record
+            stk execute mysql --db-host ${DB_HOST} --db-name ${ENV}_sql_execution_record --db-user ${DB_DEVOPS_USERNAME} --db-password ${DB_DEVOPS_PASSWD} --sql-filename ${file}.record --sql-type other
+          else
+            echo "该SQL脚本已在${ENV}环境执行过，不允许再次执行"
+          fi
+
+        fi
+      done
+
+      # 有SQL文件变动并且执行成功，更新归档的SQL记录列表
+      if [ $IF_HAVE_SQL -eq 1 ];then
+        echo "更新SQL记录列表$SQL_LIST_NAME"
+        rm -rf $SQL_LIST_NAME
+        for sql_file in `find sql* -type f -name "*.sql"|grep -v "张三-123456-demo"`
+        do
+          sql_file_md5=$(md5sum $sql_file|cut -d " " -f1)
+          echo "$sql_file $sql_file_md5" >>$SQL_LIST_NAME
+        done
+          
+        stk update gitlab --gitlab-addr ${GITLAB_ADDRESS} --gitlab-project-id ${CI_PROJECT_ID} \
+        --gitlab-project-branch ${CI_COMMIT_BRANCH} --gitlab-token ${CONFIGS_TOKEN} \
+        --gitlab-filename-list $SQL_LIST_NAME --gitlab-commit-username "${CI_COMMIT_AUTHOR}[skip ci]"          
+      fi  
+  only:
+    refs:
+      - main
+
+

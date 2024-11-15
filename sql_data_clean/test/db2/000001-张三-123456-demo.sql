@@ -1,0 +1,1 @@
+delete from test_1 where id = 1;
